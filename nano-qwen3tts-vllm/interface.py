@@ -165,8 +165,11 @@ class Qwen3TTSInterface:
         self.enforce_eager = enforce_eager
         self.tensor_parallel_size = tensor_parallel_size
         self.zmq_bridge = zmq_bridge
-        self.talker_llm = TalkerLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.3)
-        self.predictor_llm = PredictorLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size)
+        # Lower gpu_memory_utilization to reduce VRAM usage (default 0.9 preallocates too much KV cache)
+        # Note: Values too low will fail - model needs ~4GB base, then KV cache on top
+        # Total VRAM with 0.4/0.5: ~4GB model + ~4GB talker KV + ~6GB predictor KV = ~14GB
+        self.talker_llm = TalkerLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.4)
+        self.predictor_llm = PredictorLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.5)
         self.processor = _get_processor(model_path)
         self.model_config = self.talker_llm.model_runner.full_config
         
