@@ -885,6 +885,21 @@ class VoiceCloneRequest(BaseModel):
     language: str = Field(default="Auto", description="Language of the text")
 
 
+class VoiceCloneCreateRequest(BaseModel):
+    """Request body for creating/saving a voice clone."""
+    name: str = Field(..., min_length=1, max_length=64, pattern=r'^[a-zA-Z0-9_-]+$',
+                      description="Voice clone name (alphanumeric, underscore, dash only)")
+    audio: str = Field(..., description="Base64-encoded reference audio (WAV/MP3/FLAC)")
+    transcript: str = Field(default="", description="Transcript of the audio (improves clone quality)")
+
+
+class VoiceCloneResponse(BaseModel):
+    """Response for voice clone operations."""
+    success: bool
+    name: str
+    message: str
+
+
 @app.post("/v1/audio/speech/clone", response_class=StreamingResponse)
 async def generate_speech_clone(request: VoiceCloneRequest):
     """
@@ -953,6 +968,119 @@ async def generate_speech_clone(request: VoiceCloneRequest):
     except Exception as e:
         logger.error(f"Voice clone error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/voice-clone/create", response_model=VoiceCloneResponse)
+async def create_voice_clone(request: VoiceCloneCreateRequest):
+    """
+    Create and save a voice clone from reference audio.
+
+    The voice clone is saved as a .pkl file in VOICES_DIR and can be used
+    immediately with /v1/audio/speech by specifying the voice name as speaker.
+    """
+    interface = get_interface()
+    loop = asyncio.get_event_loop()
+
+    try:
+        # Check if name already exists
+        pkl_path = VOICES_DIR / f"{request.name}.pkl"
+        if pkl_path.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Voice clone '{request.name}' already exists. Use PUT to update or DELETE first."
+            )
+
+        # Decode audio
+        try:
+            audio_bytes = base64.b64decode(request.audio)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
+
+        logger.info(f"Creating voice clone '{request.name}': {len(audio_bytes)} bytes audio, transcript={bool(request.transcript)}")
+
+        # Create voice clone prompt
+        # Interface expects file path, so save to temp file first
+        import tempfile
+        def _create_prompt():
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+            try:
+                return interface.create_voice_clone_prompt(
+                    ref_audio=tmp_path,
+                    ref_text=request.transcript if request.transcript else None,
+                    x_vector_only_mode=not bool(request.transcript),
+                )
+            finally:
+                os.unlink(tmp_path)  # Clean up temp file
+
+        voice_clone_prompt = await loop.run_in_executor(None, _create_prompt)
+
+        # Save to file
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(voice_clone_prompt, f)
+
+        # Clear cache so new voice is immediately available
+        load_voice_clone_prompt.cache_clear()
+
+        logger.info(f"Voice clone '{request.name}' created successfully")
+
+        return VoiceCloneResponse(
+            success=True,
+            name=request.name,
+            message=f"Voice clone '{request.name}' created successfully"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create voice clone: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/v1/voice-clone/{name}", response_model=VoiceCloneResponse)
+async def delete_voice_clone(name: str):
+    """Delete a voice clone by name."""
+    pkl_path = VOICES_DIR / f"{name}.pkl"
+
+    if not pkl_path.exists():
+        raise HTTPException(status_code=404, detail=f"Voice clone '{name}' not found")
+
+    try:
+        pkl_path.unlink()
+        load_voice_clone_prompt.cache_clear()
+
+        logger.info(f"Voice clone '{name}' deleted")
+
+        return VoiceCloneResponse(
+            success=True,
+            name=name,
+            message=f"Voice clone '{name}' deleted successfully"
+        )
+    except Exception as e:
+        logger.error(f"Failed to delete voice clone: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/voice-clone/{name}")
+async def get_voice_clone_info(name: str):
+    """Get info about a specific voice clone."""
+    pkl_path = VOICES_DIR / f"{name}.pkl"
+
+    if not pkl_path.exists():
+        raise HTTPException(status_code=404, detail=f"Voice clone '{name}' not found")
+
+    stat = pkl_path.stat()
+
+    return {
+        "name": name,
+        "exists": True,
+        "size_bytes": stat.st_size,
+        "created_at": stat.st_ctime,
+        "modified_at": stat.st_mtime,
+    }
 
 
 if __name__ == "__main__":
