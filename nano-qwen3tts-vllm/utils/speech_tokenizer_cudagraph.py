@@ -163,7 +163,14 @@ class SpeechTokenizerCUDAGraph:
         else:
             print("Skipping CUDA graph capture (CPU).")
 
-        print(f"Speech tokenizer (CUDAGraph) loaded: sample_rate={self.sample_rate}Hz, device={self.device}")
+        self._samples_per_frame = self.tokenizer.model.decoder.total_upsample
+        print(f"Speech tokenizer (CUDAGraph) loaded: sample_rate={self.sample_rate}Hz, "
+              f"samples_per_frame={self._samples_per_frame}, device={self.device}")
+
+    @property
+    def samples_per_frame(self) -> int:
+        """Exact number of audio samples per codec frame."""
+        return self._samples_per_frame
 
     @torch.inference_mode()
     def decode(self, inputs: List[dict]) -> Tuple[List, int]:

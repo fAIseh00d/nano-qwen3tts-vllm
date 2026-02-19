@@ -15,6 +15,37 @@ from __future__ import annotations
 import torch
 from typing import Callable, Optional, Union, List
 
+# Language alias mapping: common abbreviations/variants → canonical names used in codec_language_id
+LANGUAGE_ALIASES = {
+    "en": "english",
+    "eng": "english",
+    "zh": "chinese",
+    "cn": "chinese",
+    "mandarin": "chinese",
+    "de": "german",
+    "deu": "german",
+    "it": "italian",
+    "ita": "italian",
+    "pt": "portuguese",
+    "por": "portuguese",
+    "es": "spanish",
+    "spa": "spanish",
+    "ja": "japanese",
+    "jpn": "japanese",
+    "ko": "korean",
+    "kor": "korean",
+    "fr": "french",
+    "fra": "french",
+    "ru": "russian",
+    "rus": "russian",
+}
+
+
+def _normalize_language(language: str) -> str:
+    """Normalize language code to canonical name."""
+    lang_lower = language.lower()
+    return LANGUAGE_ALIASES.get(lang_lower, lang_lower)
+
 @torch.inference_mode()
 def prepare_inputs(
     config,
@@ -123,19 +154,19 @@ def prepare_inputs(
                 speaker_embed = None
 
         assert language is not None
-        if language.lower() == "auto":
+        language = _normalize_language(language)
+        if language == "auto":
             language_id = None
         else:
-            if language.lower() not in config.talker_config.codec_language_id:
+            if language not in config.talker_config.codec_language_id:
+                supported = list(config.talker_config.codec_language_id.keys())
                 raise NotImplementedError(
-                    f"Language {language} not implemented"
+                    f"Language '{language}' not supported. Valid: {supported + ['auto']}"
                 )
-            language_id = config.talker_config.codec_language_id[
-                language.lower()
-            ]
+            language_id = config.talker_config.codec_language_id[language]
 
         if (
-            language.lower() in ["chinese", "auto"]
+            language in ["chinese", "auto"]
             and speaker != ""
             and speaker is not None
             and config.talker_config.spk_is_dialect.get(

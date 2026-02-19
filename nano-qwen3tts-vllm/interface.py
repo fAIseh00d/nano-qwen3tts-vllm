@@ -360,7 +360,19 @@ class Qwen3TTSInterface:
         self.predictor_input_embeddings = self.predictor_llm.model_runner.model.model.codec_embedding
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+        # Talker model dtype — used to cast speaker embeddings (must match codec embeddings).
+        self.dtype = next(self.input_embedding.parameters()).dtype
+
+        # EOS token IDs for termination detection. Include both codec_eos and codec_think_eos
+        # as safety measure (model occasionally fails to generate expected EOS ~0.5% of time).
+        # See: https://github.com/QwenLM/Qwen3-TTS/issues/118
+        talker_cfg = self.model_config.talker_config
+        self._eos_token_ids = {
+            talker_cfg.codec_eos_token_id,
+            getattr(talker_cfg, 'codec_think_eos_id', None),
+        }
+        self._eos_token_ids.discard(None)  # Remove None if codec_think_eos_id doesn't exist
+
         # Initialize speech tokenizer and speaker encoder if available
         self.speech_tokenizer = None
         self.speaker_encoder = None
@@ -617,8 +629,12 @@ class Qwen3TTSInterface:
         # spec shape: [batch, freq_bins, time] or [freq_bins, time]
         # mel_basis shape: [num_mels, freq_bins]
         # Result: [batch, num_mels, time] or [num_mels, time]
-        mel_spec = torch.matmul(mel_basis, spec)  # matmul handles batch dimension correctly
-        
+        mel_spec = torch.matmul(mel_basis, spec)
+
+        # Dynamic range compression (log-mel) — matches official Qwen3-TTS.
+        # The speaker encoder expects log-scale, not linear-scale.
+        mel_spec = torch.log(torch.clamp(mel_spec, min=1e-5))
+
         return mel_spec
     
     def _codebook_ids_to_audio(self, codebook_ids_list: List[List[int]]) -> Tuple[List[np.ndarray], int]:
@@ -790,8 +806,8 @@ class Qwen3TTSInterface:
         
         # Prepare generate_speaker_prompt_fn and generate_icl_prompt_fn
         def generate_speaker_prompt_fn(prompt):
-            return generate_speaker_prompt(prompt, self.device)
-        
+            return generate_speaker_prompt(prompt, self.device, dtype=self.dtype)
+
         def generate_icl_prompt_fn(text_id, ref_id, ref_code, tts_pad_embed, tts_eos_embed, non_streaming_mode):
             return generate_icl_prompt(
                 text_id=text_id,
@@ -807,7 +823,7 @@ class Qwen3TTSInterface:
                 code_predictor_embeddings=self.predictor_input_embeddings,
                 device=self.device,
             )
-        
+
         # Prepare inputs
         talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = prepare_inputs(
             config=self.model_config,
@@ -827,7 +843,7 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
     
@@ -932,8 +948,8 @@ class Qwen3TTSInterface:
             
             # Prepare generate_speaker_prompt_fn and generate_icl_prompt_fn
             def generate_speaker_prompt_fn(prompt):
-                return generate_speaker_prompt(prompt, self.device)
-            
+                return generate_speaker_prompt(prompt, self.device, dtype=self.dtype)
+
             def generate_icl_prompt_fn(text_id, ref_id, ref_code, tts_pad_embed, tts_eos_embed, non_streaming_mode):
                 return generate_icl_prompt(
                     text_id=text_id,
@@ -1060,7 +1076,7 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
     
@@ -1123,7 +1139,7 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
 
@@ -1160,7 +1176,7 @@ class Qwen3TTSInterface:
         if self.zmq_bridge is not None:
             raise RuntimeError("When using ZMQ bridge use generate_async() after await start_zmq_tasks()")
         request_id = request_id or str(uuid.uuid4())
-        talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
+        talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
         predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
         yield from self._generate_caller_driven(
             inputs_embeds, trailing_text_hiddens, tts_pad_embed,
@@ -1178,7 +1194,7 @@ class Qwen3TTSInterface:
         """Async generator of codebook_id chunks. ZMQ path; step() runs as asyncio tasks. Call await start_zmq_tasks() first."""
         if self.zmq_bridge is None:
             raise RuntimeError("generate_async requires zmq_bridge")
-        talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
+        talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
         predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
         request_id = request_id or str(uuid.uuid4())
         request_queue: asyncio.Queue = asyncio.Queue()
@@ -1205,7 +1221,7 @@ class Qwen3TTSInterface:
                     token_ids = payload["token_ids"]
                     hidden_states = payload.get("hidden_states")
                     last_id = token_ids[-1]
-                    if last_id == 2150:
+                    if last_id in self._eos_token_ids:
                         self.talker_llm.clear_request(request_id)
                         break
 
@@ -1271,12 +1287,15 @@ class Qwen3TTSInterface:
                             f"frame_total={(t_post_end - t_wait_talker)*1000:.1f}ms"
                         )
         finally:
-            # Always clean up: remove from talker scheduler (prevents ghost sequences
-            # that cause batch_wait timeouts for subsequent requests) and from queue map.
+            # Clear pending LLM requests so the engine loop stops working on them
             try:
                 self.talker_llm.clear_request(request_id)
             except Exception:
                 pass  # may already be cleared via EOS path
+            try:
+                self.predictor_llm.clear_request(request_id)
+            except Exception:
+                pass
             async with self._queues_lock:
                 self._request_queues.pop(request_id, None)
 
@@ -1306,7 +1325,7 @@ class Qwen3TTSInterface:
                 continue
             _, _, token_ids, hidden_states, is_finished = match
             last_id = token_ids[-1]
-            if last_id == 2150:
+            if last_id in self._eos_token_ids:
                 self.talker_llm.clear_request(request_id)
                 return
 
