@@ -253,6 +253,7 @@ class SpeechRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text to synthesize")
     language: str = Field(default="English", description="Language of the text")
     speaker: str = Field(default="", description="Speaker name (empty for voice cloning mode)")
+    sample_rate: int = Field(default=None, description="Output sample rate (default: OUTPUT_SAMPLE_RATE)")
 
 
 @app.get("/health")
@@ -350,10 +351,10 @@ async def _decode_worker_loop():
             decode_latency = (time.time() - decode_start) * 1000
             logger.info(f"[decoder] batch_size={len(batch)} latency={decode_latency:.2f}ms")
             for req, wav in zip(batch, wav_results):
-                wav_24k = _resample_to_24k(wav, sr)
-                pcm16 = _float_to_pcm16(wav_24k)
+                wav_resampled = _resample(wav, sr, OUTPUT_SAMPLE_RATE)
+                pcm16 = _float_to_pcm16(wav_resampled)
                 if not req["future"].done():
-                    req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
+                    req["future"].set_result((pcm16, OUTPUT_SAMPLE_RATE))
         except Exception as e:
             for req in batch:
                 if not req["future"].done():
@@ -369,18 +370,19 @@ async def _decode_batched(audio_codes: list) -> tuple[np.ndarray, int]:
     return await future
 
 
-def _decode_inline(audio_codes: list) -> tuple[np.ndarray, int]:
+def _decode_inline(audio_codes: list, output_sr: int = None) -> tuple[np.ndarray, int]:
     """Decode directly on the calling thread (no executor).
 
     Used for FIRST-chunk decode to avoid the ~130ms scheduling delay caused by
     run_in_executor callback delivery competing with GPU prefills on the event loop.
     Single-code CUDA-graph decode takes ~15ms, acceptable for inline use.
     """
+    output_sr = output_sr or OUTPUT_SAMPLE_RATE
     tokenizer = get_tokenizer()
     with torch.inference_mode():
         wav_list, sr = tokenizer.chunked_decode([{"audio_codes": audio_codes}])
-    wav_24k = _resample_to_24k(wav_list[0], sr)
-    return _float_to_pcm16(wav_24k), TARGET_SAMPLE_RATE
+    wav_resampled = _resample(wav_list[0], sr, output_sr)
+    return _float_to_pcm16(wav_resampled), output_sr
 
 
 def get_voice_clones():
@@ -484,7 +486,7 @@ async def generate_voice_clone_codes(interface, text: str, language: str, voice_
 
 
 
-async def generate_speech_stream(request: SpeechRequest):
+async def generate_speech_stream(request: SpeechRequest, output_sr: int = None):
     """
     Streaming decode: first chunk decoded inline for minimal latency,
     subsequent chunks use producer/consumer with batched decode worker.
@@ -538,7 +540,7 @@ async def generate_speech_stream(request: SpeechRequest):
             return  # generator produced nothing
 
         t_first_code = time.time()
-        pcm16_first, _ = _decode_inline(first_codes)
+        pcm16_first, _ = _decode_inline(first_codes, output_sr)
         t_first_decoded = time.time()
         logger.info(
             f"[stream] first chunk codes={len(first_codes)} "
@@ -583,7 +585,7 @@ async def generate_speech_stream(request: SpeechRequest):
                 else:
                     pcm16, _ = await loop.run_in_executor(
                         None,
-                        lambda c=item: _decode_batch_sync(tokenizer, c),
+                        lambda c=item, sr=output_sr: _decode_batch(tokenizer, c, sr),
                     )
                 chunk = pcm16[prev_len_24k:].tobytes()
                 prev_len_24k = len(pcm16)
@@ -620,14 +622,15 @@ async def generate_speech_stream(request: SpeechRequest):
 async def generate_speech(request: SpeechRequest):
     """
     Generate speech from text.
-    Returns raw PCM 16-bit mono at 24 kHz (audio/L16).
+    Returns raw PCM 16-bit mono at OUTPUT_SAMPLE_RATE (default 16kHz).
     Uses generate_custom_voice_async (requires USE_ZMQ=1).
     """
+    output_sr = request.sample_rate or OUTPUT_SAMPLE_RATE
     try:
         return StreamingResponse(
-            generate_speech_stream(request),
+            generate_speech_stream(request, output_sr),
             media_type="audio/L16",
-            headers={"Sample-Rate": str(TARGET_SAMPLE_RATE)},
+            headers={"Sample-Rate": str(output_sr)},
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
